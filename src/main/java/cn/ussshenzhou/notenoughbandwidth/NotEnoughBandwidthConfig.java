@@ -7,7 +7,6 @@ import com.google.gson.annotations.Expose;
 import com.mojang.logging.LogUtils;
 import net.minecraft.util.Mth;
 import net.neoforged.neoforge.network.payload.*;
-import net.neoforged.neoforge.network.registration.NetworkRegistry;
 
 import java.util.HashSet;
 import java.util.regex.Pattern;
@@ -39,7 +38,7 @@ public class NotEnoughBandwidthConfig implements TConfig {
 
     @SuppressWarnings("UnstableApiUsage")
     @Expose(serialize = false, deserialize = false)
-    public static final HashSet<String> COMMON_BLOCK_LIST = new HashSet<>() {{
+    public static final HashSet<String> COMMON_BLACK_LIST = new HashSet<>() {{
         add("minecraft:finish_configuration");
         add(PacketAggregationPacket.TYPE.id().toString());
         add("minecraft:login");
@@ -58,7 +57,7 @@ public class NotEnoughBandwidthConfig implements TConfig {
 
     public static boolean skipType(String type) {
         var cfg = get();
-        return COMMON_BLOCK_LIST.contains(type) || (cfg.compatibleMode && cfg.blackList.contains(type));
+        return COMMON_BLACK_LIST.contains(type) || (cfg.compatibleMode && cfg.blackList.contains(type));
     }
 
     public int getContextLevel() {
