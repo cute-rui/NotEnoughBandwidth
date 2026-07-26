@@ -1,0 +1,15 @@
+[package]
+name = "neb-zstd-client"
+description = "Client library for the NEB remote zstd offload service, loaded by the JVM via FFM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the artifact the JVM loads via FFM.
+# rlib: lets Rust integration tests link the crate.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+neb-offload-core = { path = "../neb-offload-core" }
+ucx-ffi = { path = "../ucx-ffi" }

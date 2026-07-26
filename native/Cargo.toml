@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["neb-offload-core", "neb-zstd-server", "neb-zstd-client", "ucx-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[profile.release]
+lto = true

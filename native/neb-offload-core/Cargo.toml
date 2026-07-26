@@ -1,0 +1,16 @@
+[package]
+name = "neb-offload-core"
+description = "Wire protocol and streaming zstd contexts for the NEB remote zstd offload service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# zstd-sys is used directly (bundled C sources) because the offload service must
+# mirror zstd-jni semantics exactly: magicless frames, explicit windowLog and a
+# per-connection streaming context flushed after every message. The high-level
+# `zstd` crate does not expose that combination reliably.
+# The `experimental` feature is required for ZSTD_c_format / ZSTD_d_format
+# (exposed as ZSTD_c_experimentalParam2 / ZSTD_d_experimentalParam1) and
+# ZSTD_f_zstd1_magicless, which the magicless wire format depends on.
+zstd-sys = { version = "2", features = ["experimental"] }

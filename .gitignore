@@ -115,5 +115,8 @@ gradle-app.setting
 run/
 runs/
 
+# Rust (native/ cargo workspace)
+native/target/
+
 # Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
 !gradle-wrapper.jar
