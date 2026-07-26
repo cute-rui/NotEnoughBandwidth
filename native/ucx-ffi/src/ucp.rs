@@ -124,6 +124,9 @@ impl SockAddrHolder {
 struct OpState {
     done: AtomicBool,
     status: Cell<raw::ucs_status_t>,
+    /// Message descriptor captured from the receive callback's `tag_info`.
+    sender_tag: Cell<u64>,
+    length: Cell<usize>,
 }
 
 impl OpState {
@@ -131,6 +134,8 @@ impl OpState {
         Self {
             done: AtomicBool::new(false),
             status: Cell::new(raw::ucs_status_t::UCS_OK),
+            sender_tag: Cell::new(0),
+            length: Cell::new(0),
         }
     }
 }
@@ -145,12 +150,22 @@ unsafe extern "C" fn op_completed_cb(
     state.done.store(true, Ordering::Release);
 }
 
+/// Receive completion: the `tag_info` argument is the authoritative message
+/// descriptor (valid for the duration of the callback, so copy it out). The
+/// `recv_info` out-param of `ucp_tag_recv_nbx` is deliberately not used: it
+/// is not populated on the immediate-completion path, which previously
+/// surfaced as phantom zero-length receives.
 unsafe extern "C" fn recv_completed_cb(
     _request: *mut c_void,
     status: raw::ucs_status_t,
-    _tag_info: *const raw::ucp_tag_recv_info_t,
+    tag_info: *const raw::ucp_tag_recv_info_t,
     user_data: *mut c_void,
 ) {
+    let state = &*(user_data as *const OpState);
+    if !tag_info.is_null() {
+        state.sender_tag.set((*tag_info).sender_tag);
+        state.length.set((*tag_info).length);
+    }
     op_completed_cb(_request, status, user_data);
 }
 
@@ -334,16 +349,18 @@ impl Worker {
         timeout: Duration,
     ) -> Result<(u64, usize), Error> {
         let state = OpState::new();
-        let mut info: raw::ucp_tag_recv_info_t = unsafe { std::mem::zeroed() };
         let mut params: raw::ucp_request_param_t = unsafe { std::mem::zeroed() };
+        // NO_IMM_CMPL forces the callback path even when the message has
+        // already arrived: on immediate completion UCX would not invoke the
+        // callback, and (depending on version) would leave recv_info
+        // unpopulated, surfacing as a phantom zero-length receive.
         params.op_attr_mask = raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32
             | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA as u32
             | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE as u32
-            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_RECV_INFO as u32;
+            | raw::ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL as u32;
         params.cb.recv = Some(recv_completed_cb);
         params.datatype = DT_CONTIG_BYTE;
         params.user_data = &state as *const OpState as *mut c_void;
-        params.recv_info.tag_info = &mut info;
 
         let request = unsafe {
             raw::ucp_tag_recv_nbx(
@@ -356,14 +373,15 @@ impl Worker {
             )
         };
         self.wait("ucp_tag_recv_nbx", request, &state, timeout)?;
-        if info.length > buf.len() {
+        let length = state.length.get();
+        if length > buf.len() {
             return Err(plain_error(format!(
                 "received message ({} bytes) larger than buffer ({} bytes)",
-                info.length,
+                length,
                 buf.len()
             )));
         }
-        Ok((info.sender_tag, info.length))
+        Ok((state.sender_tag.get(), length))
     }
 
     /// Blocking tagged send. Returns once the buffer has been consumed by the
