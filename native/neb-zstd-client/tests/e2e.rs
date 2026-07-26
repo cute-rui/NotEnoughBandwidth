@@ -90,6 +90,20 @@ fn sample(n_records: usize) -> Vec<u8> {
     v
 }
 
+/// Deterministic pseudo-random bytes (xorshift), used as an incompressible
+/// shared base so cross-message window reuse is what makes the difference.
+fn prng_bytes(seed: u64, n: usize) -> Vec<u8> {
+    let mut state = seed.max(1);
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        })
+        .collect()
+}
+
 fn compress(handle: i64, conn: u32, raw: &[u8]) -> Vec<u8> {
     let mut dst = vec![0u8; compress_bound(raw.len())];
     let n = neb_compress(
@@ -137,22 +151,30 @@ fn end_to_end_round_trip() {
     let handle = neb_open(addr.as_ptr() as *const _, 2, 3, 23, MAX_PAYLOAD);
     assert_ne!(handle, 0, "neb_open failed");
 
-    let raw_a = sample(2000);
+    // Two messages sharing a large incompressible base: cross-message context
+    // reuse is what shrinks the second one. (Self-similar repetitive data
+    // compresses to near its entropy floor already on the first message, so
+    // history adds little there — verified against in-process zstd.)
+    let base = prng_bytes(42, 64 * 1024);
+    let mut raw_a1 = base.clone();
+    raw_a1.extend_from_slice(b"first-message-suffix");
+    let mut raw_a2 = base.clone();
+    raw_a2.extend_from_slice(b"other-message-suffix!");
     let raw_b = sample(1500);
 
     // --- conn 7: streaming compress with context reuse over the wire ---
-    let c1 = compress(handle, 7, &raw_a);
+    let c1 = compress(handle, 7, &raw_a1);
     assert_ne!(&c1[..4], &ZSTD_MAGIC, "frames must be magicless");
-    let c2 = compress(handle, 7, &raw_a);
+    let c2 = compress(handle, 7, &raw_a2);
     assert!(
         c2.len() < c1.len() / 2,
-        "streaming context reuse should shrink the repeated message: {} -> {}",
+        "streaming context reuse should shrink the repeated base: {} -> {}",
         c1.len(),
         c2.len()
     );
     // The same connection's streaming decoder reads both in order.
-    assert_eq!(decompress(handle, 7, &c1, raw_a.len()), raw_a);
-    assert_eq!(decompress(handle, 7, &c2, raw_a.len()), raw_a);
+    assert_eq!(decompress(handle, 7, &c1, raw_a1.len()), raw_a1);
+    assert_eq!(decompress(handle, 7, &c2, raw_a2.len()), raw_a2);
 
     // --- conn 9: one-shot stateless frames through a fresh decoder ---
     let mut dst = vec![0u8; compress_bound(raw_b.len())];
