@@ -222,12 +222,13 @@ ucx_info -d | grep -E 'rc_verbs|rc_mlx5'
 
 ```bash
 ./neb-zstd-server \
-    --listen 0.0.0.0:19999 \   # 监听地址（默认值）
-    --threads 0 \              # worker 线程数，0 = 全部物理核（默认值）
-    --level 3 \                # zstd 压缩级别（默认值）
-    --window-log 23 \          # zstd windowLog（默认值）
-    --max-payload 8388608 \    # 单请求最大 payload 字节数（默认值，8MB）
-    --gc-secs 600              # per-连接上下文空闲回收秒数（默认值）
+    --listen 0.0.0.0:19999 \        # 数据面监听地址（默认值）
+    --metrics-listen 0.0.0.0:9100 \ # 指标端点（默认值），off 可关闭
+    --threads 16 \                  # worker 线程数（默认：全部可用核）
+    --level 3 \                     # zstd 压缩级别（默认值）
+    --window-log 23 \               # zstd windowLog（默认值）
+    --max-payload 8388608 \         # 单请求最大 payload 字节数（默认值，8MB）
+    --gc-secs 600                   # per-连接上下文空闲回收秒数（默认值）
 ```
 
 ### mod 配置对照
@@ -244,6 +245,52 @@ ucx_info -d | grep -E 'rc_verbs|rc_mlx5'
 
 > [!WARNING]
 > **参数一致性是硬性要求**：server 的 `--level` 必须等于 mod 的压缩 level（3），`--window-log` 必须等于 mod 的 `contextLevel`。客户端收到 HELLO 后会逐项校验，不一致即握手失败（`STATUS_PARAM_MISMATCH`），该连接按故障语义处理。同理，`--max-payload` 不应小于服务器可能产生的最大聚合包。
+
+## 监控指标（Metrics）
+
+server 内置 Prometheus 文本格式的指标端点，默认 `http://<host>:9100/metrics`，可直接被 vmagent（VictoriaMetrics）或 Prometheus 抓取；`--metrics-listen off` 可关闭。端点是明文 HTTP 且无鉴权，请只对监控网段开放（防火墙/安全组限制）。
+
+### 指标清单
+
+| 指标 | 类型 | 标签 | 说明 |
+|---|---|---|---|
+| `neb_zstd_endpoints` | gauge | — | 存活的 UCX endpoint 数（客户端 slot 连接） |
+| `neb_zstd_contexts` | gauge | — | 存活的 per-连接 zstd 上下文数 |
+| `neb_zstd_connections_accepted_total` | counter | — | 接受并完成 HELLO 的连接数 |
+| `neb_zstd_connections_dropped_total` | counter | `reason` = transport / hard_cap / wrap / hello | 断开（或未完成接受）的连接数 |
+| `neb_zstd_contexts_evicted_total` | counter | `reason` = gc / endpoint | 上下文回收数（GC 过期 / 端点断开连带清理） |
+| `neb_zstd_requests_total` | counter | `op` = compress / decompress / oneshot / reset / invalid × `status` = ok / bad_request / zstd_error / too_large | 请求处理数 |
+| `neb_zstd_request_bytes_total` | counter | `op` × `direction` = in / out | 处理的 payload 字节数 |
+| `neb_zstd_request_duration_seconds` | histogram | `op`（50µs–50ms 共 10 桶） | 实际 zstd 计算耗时（不含网络） |
+
+### vmagent 抓取配置
+
+vmagent 直接使用 Prometheus 格式的 scrape 配置（`-promscrape.config`）：
+
+```yaml
+scrape_configs:
+  - job_name: neb-zstd-server
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["<压缩服务器IP>:9100"]
+```
+
+### 常用 MetricsQL
+
+压缩率（越小越好，对照 README 的 7.6%~39%）：
+
+```promql
+sum(rate(neb_zstd_request_bytes_total{op="compress",direction="out"}[5m]))
+  / sum(rate(neb_zstd_request_bytes_total{op="compress",direction="in"}[5m]))
+```
+
+压缩延迟 p99：
+
+```promql
+histogram_quantile(0.99, sum(rate(neb_zstd_request_duration_seconds_bucket{op="compress"}[5m])) by (le))
+```
+
+异常告警参考：`rate(neb_zstd_connections_dropped_total{reason="transport"}[5m]) > 0`（传输层不稳）、`neb_zstd_contexts` 持续增长（GC 失效或连接泄漏）。
 
 ## 故障语义与回退策略
 

@@ -20,6 +20,13 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod metrics;
+
+use metrics::{
+    Metrics, OP_COMPRESS_IDX, OP_DECOMPRESS_IDX, OP_INVALID_IDX, OP_ONESHOT_IDX, OP_RESET_IDX,
+    STATUS_BAD_REQUEST_IDX, STATUS_OK_IDX, STATUS_TOO_LARGE_IDX, STATUS_ZSTD_ERROR_IDX,
+};
+
 use neb_offload_core::{
     compress_bound, conn_id_of, ep_id_of, hello_tag, response_message, response_tag,
     CompressStream, DecompressStream, Hello, RequestHeader, OP_COMPRESS, OP_COMPRESS_ONESHOT,
@@ -38,6 +45,7 @@ macro_rules! log {
 }
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:19999";
+const DEFAULT_METRICS_LISTEN: &str = "0.0.0.0:9100";
 const DEFAULT_LEVEL: i32 = 3;
 const DEFAULT_WINDOW_LOG: u32 = 23;
 const DEFAULT_MAX_PAYLOAD: usize = 8 * 1024 * 1024;
@@ -61,6 +69,8 @@ const GC_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy)]
 struct Config {
     listen: SocketAddr,
+    /// Prometheus metrics endpoint; `None` disables the HTTP listener.
+    metrics_listen: Option<SocketAddr>,
     threads: usize,
     level: i32,
     window_log: u32,
@@ -97,6 +107,9 @@ USAGE:
 
 OPTIONS:
     --listen ADDR:PORT   Listen address (default: {DEFAULT_LISTEN})
+    --metrics-listen ADDR:PORT
+                         Prometheus metrics endpoint serving GET /metrics
+                         (default: {DEFAULT_METRICS_LISTEN}, "off" to disable)
     --threads N          Serve worker threads (default: available parallelism)
     --level N            zstd compression level, 1..=22 (default: {DEFAULT_LEVEL})
     --window-log N       zstd window log, 21..=25 (default: {DEFAULT_WINDOW_LOG})
@@ -122,6 +135,10 @@ fn parse_val<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String>
 fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut cfg = Config {
         listen: parse_val("--listen", DEFAULT_LISTEN).expect("built-in default must parse"),
+        metrics_listen: Some(
+            parse_val("--metrics-listen", DEFAULT_METRICS_LISTEN)
+                .expect("built-in default must parse"),
+        ),
         threads: default_threads(),
         level: DEFAULT_LEVEL,
         window_log: DEFAULT_WINDOW_LOG,
@@ -136,6 +153,13 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag {
             "--listen" => cfg.listen = parse_val(flag, value)?,
+            "--metrics-listen" => {
+                cfg.metrics_listen = if value.eq_ignore_ascii_case("off") {
+                    None
+                } else {
+                    Some(parse_val(flag, value)?)
+                };
+            }
             "--threads" => {
                 cfg.threads = parse_val(flag, value)?;
                 if cfg.threads == 0 {
@@ -176,6 +200,13 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
 fn run(cfg: Config) -> Result<(), String> {
     let context = Context::new().map_err(|e| format!("failed to initialize UCX: {e}"))?;
 
+    let metrics = Arc::new(Metrics::new());
+    if let Some(addr) = cfg.metrics_listen {
+        metrics::spawn_http(Arc::clone(&metrics), addr)
+            .map_err(|e| format!("failed to bind metrics endpoint on {addr}: {e}"))?;
+        log!("metrics on http://{addr}/metrics");
+    }
+
     // One accept queue per worker thread; the listener callback pushes
     // incoming connection requests into them round-robin.
     let queues: Arc<Vec<Mutex<VecDeque<ConnRequest>>>> = Arc::new(
@@ -189,6 +220,7 @@ fn run(cfg: Config) -> Result<(), String> {
     for i in 0..cfg.threads {
         let context = Arc::clone(&context);
         let queues = Arc::clone(&queues);
+        let metrics = Arc::clone(&metrics);
         std::thread::Builder::new()
             .name(format!("neb-worker-{i}"))
             .spawn(move || {
@@ -199,7 +231,7 @@ fn run(cfg: Config) -> Result<(), String> {
                         std::process::exit(1);
                     }
                 };
-                WorkerState::new(worker, cfg).serve_loop(&queues[i]);
+                WorkerState::new(worker, cfg, metrics).serve_loop(&queues[i]);
             })
             .map_err(|e| format!("failed to spawn worker thread {i}: {e}"))?;
     }
@@ -261,6 +293,7 @@ impl ConnCtx {
 struct WorkerState {
     worker: Worker,
     cfg: Config,
+    metrics: Arc<Metrics>,
     /// Live endpoints by their server-assigned id.
     endpoints: HashMap<u16, Endpoint>,
     /// Per-connection zstd contexts by (endpoint id, game connection id).
@@ -275,10 +308,11 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(worker: Worker, cfg: Config) -> Self {
+    fn new(worker: Worker, cfg: Config, metrics: Arc<Metrics>) -> Self {
         Self {
             worker,
             cfg,
+            metrics,
             endpoints: HashMap::new(),
             ctxs: HashMap::new(),
             next_ep_id: 0,
@@ -340,10 +374,12 @@ impl WorkerState {
             {
                 Ok(()) => {
                     self.endpoints.insert(ep_id, ep);
+                    self.metrics.endpoint_accepted();
                     log!("accepted endpoint {ep_id} ({} live)", self.endpoints.len());
                 }
                 Err(e) => {
                     log!("HELLO failed on endpoint {ep_id}: {e}");
+                    self.metrics.connection_failed_before_accept(3 /* hello */);
                     // `ep` goes out of scope here and is force-closed.
                 }
             }
@@ -356,22 +392,26 @@ impl WorkerState {
     fn alloc_ep_id(&mut self) -> u16 {
         let id = self.next_ep_id;
         self.next_ep_id = self.next_ep_id.wrapping_add(1);
-        self.drop_endpoint(id, "endpoint id wrap-around");
+        self.drop_endpoint(id, "endpoint id wrap-around", 2 /* wrap */);
         id
     }
 
     /// Force-close an endpoint (via `Endpoint::drop`) and purge every
     /// connection context pinned to it — after a transport error those
-    /// contexts are unrecoverable anyway.
-    fn drop_endpoint(&mut self, ep_id: u16, reason: &str) {
+    /// contexts are unrecoverable anyway. `reason_idx` indexes
+    /// `metrics::DROP_REASONS`.
+    fn drop_endpoint(&mut self, ep_id: u16, reason: &str, reason_idx: usize) {
         if self.endpoints.remove(&ep_id).is_some() {
             log!("dropping endpoint {ep_id}: {reason}");
+            self.metrics.endpoint_dropped(reason_idx);
         }
         let before = self.ctxs.len();
         self.ctxs.retain(|&(e, _), _| e != ep_id);
         let purged = before - self.ctxs.len();
         if purged > 0 {
             log!("purged {purged} context(s) of endpoint {ep_id}");
+            self.metrics
+                .contexts_evicted(1 /* endpoint */, purged as u64);
         }
     }
 
@@ -387,7 +427,7 @@ impl WorkerState {
             let mut sink = [0u8; 1];
             let _ = self.worker.tag_recv(tag, u64::MAX, &mut sink, RECV_TIMEOUT);
             log!("endpoint {ep_id} sent a {len}-byte message (hard cap {HARD_CAP}), dropping it");
-            self.drop_endpoint(ep_id, "message beyond hard cap");
+            self.drop_endpoint(ep_id, "message beyond hard cap", 1 /* hard_cap */);
             return;
         }
 
@@ -396,7 +436,7 @@ impl WorkerState {
         let mut buf = vec![0u8; len];
         if let Err(e) = self.worker.tag_recv(tag, u64::MAX, &mut buf, RECV_TIMEOUT) {
             log!("receive on endpoint {ep_id} failed: {e}");
-            self.drop_endpoint(ep_id, "transport error on receive");
+            self.drop_endpoint(ep_id, "transport error on receive", 0 /* transport */);
             return;
         }
 
@@ -408,8 +448,17 @@ impl WorkerState {
         }
 
         let (status, payload) = if len < REQUEST_HEADER_LEN {
+            self.metrics.request(
+                OP_INVALID_IDX,
+                STATUS_BAD_REQUEST_IDX,
+                len,
+                0,
+                Duration::ZERO,
+            );
             (STATUS_BAD_REQUEST, Vec::new())
         } else if len > self.cfg.max_payload + REQUEST_HEADER_LEN {
+            self.metrics
+                .request(OP_INVALID_IDX, STATUS_TOO_LARGE_IDX, len, 0, Duration::ZERO);
             (STATUS_MESSAGE_TOO_LARGE, Vec::new())
         } else {
             self.dispatch(tag, &buf)
@@ -424,18 +473,46 @@ impl WorkerState {
         };
         if let Err(e) = result {
             log!("send on endpoint {ep_id} failed: {e}");
-            self.drop_endpoint(ep_id, "transport error on send");
+            self.drop_endpoint(ep_id, "transport error on send", 0 /* transport */);
         }
     }
 
-    /// Execute one fully-received request and return the response status and
-    /// payload. Only called with `buf.len() >= REQUEST_HEADER_LEN` and a
-    /// payload within the configured limit.
+    /// Execute one fully-received request, record its metrics, and return
+    /// the response status and payload. Only called with
+    /// `buf.len() >= REQUEST_HEADER_LEN` and a payload within the configured
+    /// limit.
     fn dispatch(&mut self, tag: u64, buf: &[u8]) -> (i32, Vec<u8>) {
+        let start = Instant::now();
+        let (op_idx, status_idx, bytes_in, (status, payload)) = self.dispatch_inner(tag, buf);
+        self.metrics
+            .request(op_idx, status_idx, bytes_in, payload.len(), start.elapsed());
+        (status, payload)
+    }
+
+    /// The actual work of [`Self::dispatch`], additionally reporting the op,
+    /// outcome and input size as metrics indices.
+    fn dispatch_inner(&mut self, tag: u64, buf: &[u8]) -> (usize, usize, usize, (i32, Vec<u8>)) {
+        /// Map a wire status code to its metrics index.
+        fn status_idx(code: i32) -> usize {
+            match code {
+                STATUS_OK => STATUS_OK_IDX,
+                STATUS_ZSTD_ERROR => STATUS_ZSTD_ERROR_IDX,
+                STATUS_MESSAGE_TOO_LARGE => STATUS_TOO_LARGE_IDX,
+                _ => STATUS_BAD_REQUEST_IDX,
+            }
+        }
+
         let key = (ep_id_of(tag), conn_id_of(tag));
         let header = match RequestHeader::decode(buf) {
             Ok(h) => h,
-            Err(_) => return (STATUS_BAD_REQUEST, Vec::new()),
+            Err(_) => {
+                return (
+                    OP_INVALID_IDX,
+                    STATUS_BAD_REQUEST_IDX,
+                    buf.len(),
+                    (STATUS_BAD_REQUEST, Vec::new()),
+                );
+            }
         };
         let payload = &buf[REQUEST_HEADER_LEN..];
         if header.payload_len as usize != payload.len() {
@@ -446,25 +523,39 @@ impl WorkerState {
                 header.payload_len,
                 payload.len()
             );
-            return (STATUS_BAD_REQUEST, Vec::new());
+            return (
+                OP_INVALID_IDX,
+                STATUS_BAD_REQUEST_IDX,
+                buf.len(),
+                (STATUS_BAD_REQUEST, Vec::new()),
+            );
         }
 
         match header.op {
             OP_COMPRESS => {
+                let created = !self.ctxs.contains_key(&key);
                 let ctx = self.ctxs.entry(key).or_insert_with(ConnCtx::new);
+                if created {
+                    self.metrics.contexts_added(1);
+                }
                 ctx.last_used = Instant::now();
                 if ctx.cctx.is_none() {
                     match CompressStream::new(self.cfg.level, self.cfg.window_log) {
                         Ok(cctx) => ctx.cctx = Some(cctx),
                         Err(e) => {
                             log!("cannot create compress context: {e}");
-                            return (STATUS_ZSTD_ERROR, Vec::new());
+                            return (
+                                OP_COMPRESS_IDX,
+                                STATUS_ZSTD_ERROR_IDX,
+                                payload.len(),
+                                (STATUS_ZSTD_ERROR, Vec::new()),
+                            );
                         }
                     }
                 }
                 let cctx = ctx.cctx.as_mut().unwrap();
                 let mut out = vec![0u8; compress_bound(payload.len())];
-                match cctx.compress(payload, &mut out) {
+                let result = match cctx.compress(payload, &mut out) {
                     Ok(n) => {
                         out.truncate(n);
                         (STATUS_OK, out)
@@ -473,7 +564,8 @@ impl WorkerState {
                         log!("compress failed on conn {}: {e}", key.1);
                         (STATUS_ZSTD_ERROR, Vec::new())
                     }
-                }
+                };
+                (OP_COMPRESS_IDX, status_idx(result.0), payload.len(), result)
             }
             OP_COMPRESS_ONESHOT => {
                 if self.oneshot.is_none() {
@@ -481,13 +573,18 @@ impl WorkerState {
                         Ok(cctx) => self.oneshot = Some(cctx),
                         Err(e) => {
                             log!("cannot create oneshot compress context: {e}");
-                            return (STATUS_ZSTD_ERROR, Vec::new());
+                            return (
+                                OP_ONESHOT_IDX,
+                                STATUS_ZSTD_ERROR_IDX,
+                                payload.len(),
+                                (STATUS_ZSTD_ERROR, Vec::new()),
+                            );
                         }
                     }
                 }
                 let cctx = self.oneshot.as_mut().unwrap();
                 let mut out = vec![0u8; compress_bound(payload.len())];
-                match cctx.compress_oneshot(payload, &mut out) {
+                let result = match cctx.compress_oneshot(payload, &mut out) {
                     Ok(n) => {
                         out.truncate(n);
                         (STATUS_OK, out)
@@ -496,45 +593,78 @@ impl WorkerState {
                         log!("oneshot compress failed: {e}");
                         (STATUS_ZSTD_ERROR, Vec::new())
                     }
-                }
+                };
+                (OP_ONESHOT_IDX, status_idx(result.0), payload.len(), result)
             }
             OP_DECOMPRESS => {
                 let raw_size = header.raw_size as usize;
                 // raw_size comes from the wire and decides an allocation;
                 // refuse absurd sizes before trusting it.
                 if raw_size > HARD_CAP {
-                    return (STATUS_MESSAGE_TOO_LARGE, Vec::new());
+                    return (
+                        OP_DECOMPRESS_IDX,
+                        STATUS_TOO_LARGE_IDX,
+                        payload.len(),
+                        (STATUS_MESSAGE_TOO_LARGE, Vec::new()),
+                    );
                 }
+                let created = !self.ctxs.contains_key(&key);
                 let ctx = self.ctxs.entry(key).or_insert_with(ConnCtx::new);
+                if created {
+                    self.metrics.contexts_added(1);
+                }
                 ctx.last_used = Instant::now();
                 if ctx.dctx.is_none() {
                     match DecompressStream::new() {
                         Ok(dctx) => ctx.dctx = Some(dctx),
                         Err(e) => {
                             log!("cannot create decompress context: {e}");
-                            return (STATUS_ZSTD_ERROR, Vec::new());
+                            return (
+                                OP_DECOMPRESS_IDX,
+                                STATUS_ZSTD_ERROR_IDX,
+                                payload.len(),
+                                (STATUS_ZSTD_ERROR, Vec::new()),
+                            );
                         }
                     }
                 }
                 let dctx = ctx.dctx.as_mut().unwrap();
                 let mut out = vec![0u8; raw_size];
-                match dctx.decompress_exact(payload, &mut out) {
+                let result = match dctx.decompress_exact(payload, &mut out) {
                     Ok(()) => (STATUS_OK, out),
                     Err(e) => {
                         log!("decompress failed on conn {}: {e}", key.1);
                         (STATUS_ZSTD_ERROR, Vec::new())
                     }
-                }
+                };
+                (
+                    OP_DECOMPRESS_IDX,
+                    status_idx(result.0),
+                    payload.len(),
+                    result,
+                )
             }
             OP_RESET => {
                 // Idempotent: the client sends this when a game connection
                 // closes, whether or not we still hold state for it.
-                self.ctxs.remove(&key);
-                (STATUS_OK, Vec::new())
+                if self.ctxs.remove(&key).is_some() {
+                    self.metrics.contexts_added(-1);
+                }
+                (
+                    OP_RESET_IDX,
+                    STATUS_OK_IDX,
+                    payload.len(),
+                    (STATUS_OK, Vec::new()),
+                )
             }
             op => {
                 log!("endpoint {} conn {}: unknown op {op}", key.0, key.1);
-                (STATUS_BAD_REQUEST, Vec::new())
+                (
+                    OP_INVALID_IDX,
+                    STATUS_BAD_REQUEST_IDX,
+                    payload.len(),
+                    (STATUS_BAD_REQUEST, Vec::new()),
+                )
             }
         }
     }
@@ -563,6 +693,8 @@ impl WorkerState {
                 before - self.ctxs.len(),
                 self.ctxs.len()
             );
+            self.metrics
+                .contexts_evicted(0 /* gc */, (before - self.ctxs.len()) as u64);
         }
     }
 }

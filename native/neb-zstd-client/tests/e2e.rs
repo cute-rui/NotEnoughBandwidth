@@ -52,6 +52,7 @@ fn free_port() -> u16 {
 fn start_server(port: u16) -> ServerGuard {
     let mut child = Command::new(server_binary())
         .args(["--listen", &format!("127.0.0.1:{port}"), "--threads", "2"])
+        .args(["--metrics-listen", "off"]) // no port to collide with on CI runners
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
