@@ -31,6 +31,7 @@
 //! `catch_unwind`: a panic must never cross the FFI boundary, it is reported
 //! as `STATUS_INTERNAL_ERROR` instead.
 
+use std::ffi::CStr;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
