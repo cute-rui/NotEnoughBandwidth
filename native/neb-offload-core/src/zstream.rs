@@ -4,19 +4,21 @@
 //! - magicless frames (`ZSTD_c_format = ZSTD_f_zstd1_magicless`)
 //! - no content-size flag (`ZSTD_c_contentSizeFlag = 0`)
 //! - explicit window log (`ZSTD_c_windowLog = 21..=25`)
-//! - one streaming context per game connection, `ZSTD_e_flush` after every
-//!   message so the peer can decode it independently, while the sliding
-//!   window keeps history across messages (this is what gives NEB its
-//!   compression ratio)
-//! - decompression uses a streaming context too (`ZSTD_d_format` magicless);
-//!   one-shot compressed messages are complete frames, which a streaming
-//!   decoder accepts transparently.
+//! - one streaming context per game connection, flushed after every message
+//!   so the peer can decode it immediately, while the sliding window keeps
+//!   history across messages (this is what gives NEB its compression ratio)
+//! - decompression uses a streaming context too; one-shot compressed messages
+//!   are complete frames, which a streaming decoder accepts transparently
+//!
+//! Implemented on the high-level `zstd` crate (`stream::raw` for the
+//! streaming contexts, `bulk` for one-shot); the magicless `Format` parameter
+//! requires the crate's `experimental` feature.
 
 use std::error::Error;
-use std::ffi::CStr;
 use std::fmt::{Display, Formatter};
 
-use zstd_sys::*;
+use zstd::stream::raw::{Decoder, Encoder, InBuffer, Operation, OutBuffer};
+use zstd::zstd_safe::{CParameter, DParameter, FrameFormat};
 
 #[derive(Debug)]
 pub struct ZstdError(String);
@@ -29,153 +31,124 @@ impl Display for ZstdError {
 
 impl Error for ZstdError {}
 
-fn check(code: usize) -> Result<usize, ZstdError> {
-    if unsafe { ZSTD_isError(code) } != 0 {
-        let name = unsafe { CStr::from_ptr(ZSTD_getErrorName(code)) };
-        Err(ZstdError(name.to_string_lossy().into_owned()))
-    } else {
-        Ok(code)
-    }
+fn map_err(op: &str, e: std::io::Error) -> ZstdError {
+    ZstdError(format!("{op}: {e}"))
 }
 
 /// Maximum compressed size for `src_size` bytes.
 pub fn compress_bound(src_size: usize) -> usize {
-    unsafe { ZSTD_compressBound(src_size) as usize }
+    zstd::zstd_safe::compress_bound(src_size)
 }
 
 /// Per-connection streaming compression context. Not `Send` on purpose: the
 /// server pins every connection to the worker thread that accepted its
 /// endpoint, so contexts never cross threads.
 pub struct CompressStream {
-    cctx: *mut ZSTD_CCtx,
+    encoder: Encoder<'static>,
+    level: i32,
+    window_log: u32,
 }
 
 impl CompressStream {
     pub fn new(level: i32, window_log: u32) -> Result<Self, ZstdError> {
-        let cctx = unsafe { ZSTD_createCCtx() };
-        if cctx.is_null() {
-            return Err(ZstdError("ZSTD_createCCtx failed".into()));
-        }
-        let result = (|| {
-            check(unsafe {
-                ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_compressionLevel, level)
-            })?;
-            check(unsafe {
-                ZSTD_CCtx_setParameter(
-                    cctx,
-                    ZSTD_cParameter::ZSTD_c_windowLog,
-                    window_log as std::ffi::c_int,
-                )
-            })?;
-            check(unsafe {
-                ZSTD_CCtx_setParameter(
-                    cctx,
-                    // ZSTD_c_format (stable alias of ZSTD_c_experimentalParam2)
-                    ZSTD_cParameter::ZSTD_c_experimentalParam2,
-                    ZSTD_format_e::ZSTD_f_zstd1_magicless as std::ffi::c_int,
-                )
-            })?;
-            check(unsafe {
-                ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_contentSizeFlag, 0)
-            })?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            unsafe { ZSTD_freeCCtx(cctx) };
-            return Err(e);
-        }
-        Ok(Self { cctx })
+        Ok(Self {
+            encoder: Self::build_encoder(level, window_log)?,
+            level,
+            window_log,
+        })
+    }
+
+    fn build_encoder(level: i32, window_log: u32) -> Result<Encoder<'static>, ZstdError> {
+        let mut encoder = Encoder::new(level).map_err(|e| map_err("create encoder", e))?;
+        encoder
+            .set_parameter(CParameter::WindowLog(window_log))
+            .map_err(|e| map_err("set windowLog", e))?;
+        encoder
+            .set_parameter(CParameter::Format(FrameFormat::Magicless))
+            .map_err(|e| map_err("set magicless format", e))?;
+        encoder
+            .set_parameter(CParameter::ContentSizeFlag(false))
+            .map_err(|e| map_err("disable content size", e))?;
+        Ok(encoder)
     }
 
     /// Compress one aggregated message, flushing afterwards so the peer's
     /// streaming decoder can decode it immediately. `out` must be at least
     /// `compress_bound(input.len())` bytes; returns the number of bytes written.
     pub fn compress(&mut self, input: &[u8], out: &mut [u8]) -> Result<usize, ZstdError> {
-        let mut in_buf = ZSTD_inBuffer {
-            src: input.as_ptr() as *const std::ffi::c_void,
-            size: input.len(),
-            pos: 0,
-        };
-        let mut out_buf = ZSTD_outBuffer {
-            dst: out.as_mut_ptr() as *mut std::ffi::c_void,
-            size: out.len(),
-            pos: 0,
-        };
-        // e_flush guarantees: all input consumed AND everything so far flushed
-        // to output (return value 0) before we are done.
-        loop {
-            let remaining = check(unsafe {
-                ZSTD_compressStream2(
-                    self.cctx,
-                    &mut out_buf,
-                    &mut in_buf,
-                    ZSTD_EndDirective::ZSTD_e_flush,
-                )
-            })? as usize;
-            if in_buf.pos == in_buf.size && remaining == 0 {
-                break;
-            }
-            if out_buf.pos == out_buf.size {
+        let mut in_buf = InBuffer::around(input);
+        let mut out_buf = OutBuffer::around(out);
+        // Feed all input...
+        while in_buf.pos() < in_buf.src.len() {
+            self.encoder
+                .run(&mut in_buf, &mut out_buf)
+                .map_err(|e| map_err("compress", e))?;
+            if in_buf.pos() < in_buf.src.len() && out_buf.pos() == out_buf.capacity() {
                 return Err(ZstdError("output buffer too small".into()));
             }
         }
-        Ok(out_buf.pos as usize)
+        // ...then flush until everything so far is decodable by the peer.
+        loop {
+            let remaining = self
+                .encoder
+                .flush(&mut out_buf)
+                .map_err(|e| map_err("flush", e))?;
+            if remaining == 0 {
+                break;
+            }
+            if out_buf.pos() == out_buf.capacity() {
+                return Err(ZstdError("output buffer too small".into()));
+            }
+        }
+        Ok(out_buf.pos())
     }
 
     /// One-shot stateless compress producing a complete frame (used for
-    /// connections with context reuse disabled). Safe to call repeatedly on
-    /// the same context: ZSTD_compress2 keeps no inter-frame state.
+    /// connections with context reuse disabled). A fresh bulk compressor is
+    /// used per call, so no state carries over between messages.
     pub fn compress_oneshot(&mut self, input: &[u8], out: &mut [u8]) -> Result<usize, ZstdError> {
-        let written = check(unsafe {
-            ZSTD_compress2(
-                self.cctx,
-                out.as_mut_ptr() as *mut std::ffi::c_void,
-                out.len(),
-                input.as_ptr() as *const std::ffi::c_void,
-                input.len(),
-            )
-        })?;
-        Ok(written as usize)
+        let mut compressor =
+            zstd::bulk::Compressor::new(self.level).map_err(|e| map_err("create compressor", e))?;
+        compressor
+            .set_parameter(CParameter::WindowLog(self.window_log))
+            .map_err(|e| map_err("set windowLog", e))?;
+        compressor
+            .set_parameter(CParameter::Format(FrameFormat::Magicless))
+            .map_err(|e| map_err("set magicless format", e))?;
+        compressor
+            .set_parameter(CParameter::ContentSizeFlag(false))
+            .map_err(|e| map_err("disable content size", e))?;
+        compressor
+            .compress_to_buffer(input, out)
+            .map_err(|e| map_err("oneshot compress", e))
     }
 
     /// Start a new stream, dropping all history. The peer's decompressor must
     /// be reset too, otherwise the streams desync.
     pub fn reset(&mut self) -> Result<(), ZstdError> {
-        check(unsafe { ZSTD_CCtx_reset(self.cctx, ZSTD_ResetDirective::ZSTD_reset_session_only) })?;
+        self.encoder = Self::build_encoder(self.level, self.window_log)?;
         Ok(())
-    }
-}
-
-impl Drop for CompressStream {
-    fn drop(&mut self) {
-        unsafe { ZSTD_freeCCtx(self.cctx) };
     }
 }
 
 /// Per-connection streaming decompression context.
 pub struct DecompressStream {
-    dctx: *mut ZSTD_DCtx,
+    decoder: Decoder<'static>,
 }
 
 impl DecompressStream {
     pub fn new() -> Result<Self, ZstdError> {
-        let dctx = unsafe { ZSTD_createDCtx() };
-        if dctx.is_null() {
-            return Err(ZstdError("ZSTD_createDCtx failed".into()));
-        }
-        let result = check(unsafe {
-            ZSTD_DCtx_setParameter(
-                dctx,
-                // ZSTD_d_format (stable alias of ZSTD_d_experimentalParam1)
-                ZSTD_dParameter::ZSTD_d_experimentalParam1,
-                ZSTD_format_e::ZSTD_f_zstd1_magicless as std::ffi::c_int,
-            )
-        });
-        if let Err(e) = result {
-            unsafe { ZSTD_freeDCtx(dctx) };
-            return Err(e);
-        }
-        Ok(Self { dctx })
+        Ok(Self {
+            decoder: Self::build_decoder()?,
+        })
+    }
+
+    fn build_decoder() -> Result<Decoder<'static>, ZstdError> {
+        let mut decoder = Decoder::new().map_err(|e| map_err("create decoder", e))?;
+        decoder
+            .set_parameter(DParameter::Format(FrameFormat::Magicless))
+            .map_err(|e| map_err("set magicless format", e))?;
+        Ok(decoder)
     }
 
     /// Decompress one message produced by [`CompressStream::compress`].
@@ -183,23 +156,22 @@ impl DecompressStream {
     /// returned and must equal it (a mismatch means the two sides desynced,
     /// e.g. after an uncoordinated reset).
     pub fn decompress(&mut self, input: &[u8], out: &mut [u8]) -> Result<usize, ZstdError> {
-        let mut in_buf = ZSTD_inBuffer {
-            src: input.as_ptr() as *const std::ffi::c_void,
-            size: input.len(),
-            pos: 0,
-        };
-        let mut out_buf = ZSTD_outBuffer {
-            dst: out.as_mut_ptr() as *mut std::ffi::c_void,
-            size: out.len(),
-            pos: 0,
-        };
-        while in_buf.pos < in_buf.size {
-            check(unsafe { ZSTD_decompressStream(self.dctx, &mut out_buf, &mut in_buf) })?;
-            if in_buf.pos < in_buf.size && out_buf.pos == out_buf.size {
+        let mut in_buf = InBuffer::around(input);
+        let mut out_buf = OutBuffer::around(out);
+        // Run at least once, even with empty input: decompress_exact relies on
+        // an empty-input run to flush bytes withheld in the decoder.
+        loop {
+            self.decoder
+                .run(&mut in_buf, &mut out_buf)
+                .map_err(|e| map_err("decompress", e))?;
+            if in_buf.pos() >= in_buf.src.len() {
+                break;
+            }
+            if out_buf.pos() == out_buf.capacity() {
                 return Err(ZstdError("output buffer too small".into()));
             }
         }
-        Ok(out_buf.pos as usize)
+        Ok(out_buf.pos())
     }
 
     /// [`decompress`](Self::decompress) with the exact-size semantics the
@@ -214,24 +186,14 @@ impl DecompressStream {
                 produced
             )));
         }
-        // ZSTD_decompressStream may have consumed the whole input into its
-        // internal buffer even after the output filled, silently withholding
+        // The decoder may have consumed the whole input into its internal
+        // buffer even after the output filled, silently withholding
         // decompressed bytes that would corrupt the next message. Probe with
         // empty input: any further output means the frame produced more than
         // the expected raw size.
         let mut probe = [0u8; 1];
-        let mut in_buf = ZSTD_inBuffer {
-            src: std::ptr::null(),
-            size: 0,
-            pos: 0,
-        };
-        let mut out_buf = ZSTD_outBuffer {
-            dst: probe.as_mut_ptr() as *mut std::ffi::c_void,
-            size: 1,
-            pos: 0,
-        };
-        check(unsafe { ZSTD_decompressStream(self.dctx, &mut out_buf, &mut in_buf) })?;
-        if out_buf.pos != 0 {
+        let withheld = self.decompress(&[], &mut probe)?;
+        if withheld != 0 {
             return Err(ZstdError(
                 "decompressed data beyond expected size (stream desync)".into(),
             ));
@@ -240,14 +202,8 @@ impl DecompressStream {
     }
 
     pub fn reset(&mut self) -> Result<(), ZstdError> {
-        check(unsafe { ZSTD_DCtx_reset(self.dctx, ZSTD_ResetDirective::ZSTD_reset_session_only) })?;
+        self.decoder = Self::build_decoder()?;
         Ok(())
-    }
-}
-
-impl Drop for DecompressStream {
-    fn drop(&mut self) {
-        unsafe { ZSTD_freeDCtx(self.dctx) };
     }
 }
 
@@ -290,6 +246,7 @@ mod tests {
         let mut compressed = vec![0u8; compress_bound(raw.len())];
         let len = cctx.compress(&raw, &mut compressed).unwrap();
         assert_ne!(&compressed[..4], &ZSTD_MAGIC, "frame must be magicless");
+        assert!(len >= 4, "magicless frame should still have content");
     }
 
     /// Deterministic pseudo-random bytes (xorshift), so messages share a large
