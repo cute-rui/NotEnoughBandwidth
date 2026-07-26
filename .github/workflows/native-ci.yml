@@ -3,11 +3,12 @@ name: Native (Rust) CI
 # CI for the UCX/RoCE remote zstd offload workspace (native/):
 # ucx-ffi, neb-zstd-server, neb-zstd-client, neb-offload-core.
 #
-# UCX is installed from the Ubuntu repositories (libucx-dev). Runners have no
-# RDMA NIC, so the end-to-end test forces UCX onto TCP/shared-memory
-# transports (UCX_TLS=tcp,self) — it exercises the full wire protocol and both
-# binaries; only the RDMA-specific transport paths require manual testing on
-# real hardware (see docs/rdma-offload.md).
+# UCX is built from the latest GitHub release (source tarball, cached per
+# release tag) with rdma-core present, so it includes the rc_verbs transport
+# used in production. Runners have no RDMA NIC, so the end-to-end test forces
+# UCX onto TCP/shared-memory transports (UCX_TLS=tcp,self) — it exercises the
+# full wire protocol and both binaries; only the RDMA-specific transport
+# paths require manual testing on real hardware (see docs/rdma-offload.md).
 
 on:
   push:
@@ -27,16 +28,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install UCX and build tools
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libucx-dev ucx-utils libclang-dev clang pkg-config build-essential
+          sudo apt-get install -y build-essential pkg-config libclang-dev clang \
+            libibverbs-dev librdmacm-dev libnuma-dev jq curl ca-certificates
+
+      - name: Resolve latest UCX release tag
+        id: ucx-release
+        run: |
+          tag=$(curl -sf https://api.github.com/repos/openucx/ucx/releases/latest | jq -r .tag_name)
+          echo "latest UCX release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Cache UCX install
+        id: ucx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ucx
+          key: ${{ runner.os }}-ucx-${{ steps.ucx-release.outputs.tag }}
+
+      # GitHub releases ship source tarballs only; build takes a few minutes
+      # and is cached per release tag above.
+      - name: Build and install UCX from GitHub release
+        if: steps.ucx-cache.outputs.cache-hit != 'true'
+        run: |
+          tag=${{ steps.ucx-release.outputs.tag }}
+          version=${tag#v}
+          curl -sfL "https://github.com/openucx/ucx/releases/download/${tag}/ucx-${version}.tar.gz" -o /tmp/ucx.tar.gz
+          tar -xzf /tmp/ucx.tar.gz -C /tmp
+          cd /tmp/ucx-${version}
+          ./configure --prefix="$HOME/ucx"
+          make -j"$(nproc)"
+          make install
+
+      - name: Configure UCX environment
+        run: |
+          echo "UCX_HOME=$HOME/ucx" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/ucx/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "$HOME/ucx/bin" >> "$GITHUB_PATH"
 
       - name: Verify UCX installation
         run: |
           ucx_info -v
-          test -f /usr/include/ucp/api/ucp.h && echo "ucp.h found"
-          pkg-config --modversion ucx || echo "no ucx.pc, default include paths will be used"
+          test -f "$UCX_HOME/include/ucp/api/ucp.h" && echo "ucp.h found"
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -47,6 +82,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
+          # Invalidate when UCX upgrades, so ucx-ffi never links stale
+          # bindgen output against a newer libucp.
+          key: ucx-${{ steps.ucx-release.outputs.tag }}
 
       - name: Format check
         working-directory: native
