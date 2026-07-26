@@ -120,6 +120,12 @@ fn map_io_error(e: UcxError) -> ClientError {
     }
 }
 
+/// Diagnostic log on stderr. `neb_open` reports failure only as a 0 return,
+/// which is undiagnosable in CI and production logs alike.
+fn log_err(msg: &str) {
+    eprintln!("[neb-zstd-client] {msg}");
+}
+
 /// Offload client handle; created by `neb_open`, reclaimed by `neb_close`.
 struct Client {
     slots: Vec<Arc<Slot>>,
@@ -169,10 +175,10 @@ impl Client {
         if conn.ep.is_some() {
             return Ok(());
         }
-        let ep = slot
-            .worker
-            .connect(&self.addr)
-            .map_err(|_| ClientError::NotConnected)?;
+        let ep = slot.worker.connect(&self.addr).map_err(|e| {
+            log_err(&format!("connect to {} failed: {e}", self.addr));
+            ClientError::NotConnected
+        })?;
 
         // The server announces itself with a HELLO message on every accepted
         // endpoint; the ep_id in its sender tag is ours from now on. The mask
@@ -187,11 +193,20 @@ impl Client {
                 &mut buf,
                 self.timeout,
             )
-            .map_err(|e| match map_io_error(e) {
-                ClientError::Timeout => ClientError::Timeout,
-                _ => ClientError::NotConnected,
+            .map_err(|e| {
+                log_err(&format!("HELLO receive from {} failed: {e}", self.addr));
+                match map_io_error(e) {
+                    ClientError::Timeout => ClientError::Timeout,
+                    _ => ClientError::NotConnected,
+                }
             })?;
-        let hello = Hello::decode(&buf[..len]).map_err(|_| ClientError::NotConnected)?;
+        let hello = Hello::decode(&buf[..len]).map_err(|e| {
+            log_err(&format!(
+                "invalid HELLO from {} (len {len}): {e}",
+                self.addr
+            ));
+            ClientError::NotConnected
+        })?;
         if i32::from(hello.level) != self.level
             || u32::from(hello.window_log) != self.window_log
             || !hello.magicless
@@ -199,6 +214,17 @@ impl Client {
         {
             // The server would produce frames the mod cannot decode (or
             // reject messages the mod sends); refuse the endpoint.
+            log_err(&format!(
+                "parameter mismatch with {}: server level={} window_log={} magicless={} max_payload={}, client level={} window_log={} max_payload={}",
+                self.addr,
+                hello.level,
+                hello.window_log,
+                hello.magicless,
+                hello.max_payload,
+                self.level,
+                self.window_log,
+                self.max_payload
+            ));
             return Err(ClientError::Status(STATUS_PARAM_MISMATCH));
         }
         conn.ep_id = ep_id_of(sender_tag);
@@ -343,11 +369,20 @@ fn neb_open_impl(
     }
     let workers = workers.clamp(1, 64) as usize;
 
-    let context = global_context().ok()?;
+    let context = global_context()
+        .map_err(|e| {
+            log_err(&format!("failed to create UCX context: code {}", e.code()));
+            e
+        })
+        .ok()?;
     let mut slots = Vec::with_capacity(workers);
     for _ in 0..workers {
         let worker = context
             .worker(raw::ucs_thread_mode_t::UCS_THREAD_MODE_SERIALIZED)
+            .map_err(|e| {
+                log_err(&format!("failed to create UCX worker: {e}"));
+                e
+            })
             .ok()?;
         slots.push(Arc::new(Slot {
             worker,
@@ -366,7 +401,13 @@ fn neb_open_impl(
     // instead of surfacing connect errors on the first packet.
     for slot in &client.slots {
         let mut conn = slot.conn.lock().ok()?;
-        client.ensure_connected(slot, &mut conn).ok()?;
+        if let Err(e) = client.ensure_connected(slot, &mut conn) {
+            log_err(&format!(
+                "initial handshake to {addr} failed: code {}",
+                e.code()
+            ));
+            return None;
+        }
     }
     Some(Box::into_raw(Box::new(client)) as c_long)
 }

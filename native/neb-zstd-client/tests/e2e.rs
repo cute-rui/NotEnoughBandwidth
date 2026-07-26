@@ -61,6 +61,8 @@ fn start_server(port: u16) -> ServerGuard {
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
+            // Forward server logs so CI output shows server-side failures.
+            eprintln!("[server] {line}");
             if line.contains("listening on") {
                 let _ = tx.send(());
             }
