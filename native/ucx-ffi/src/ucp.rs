@@ -58,9 +58,11 @@ fn status_error(op: &str, status: raw::ucs_status_t) -> Error {
 }
 
 /// Status pointers returned by nbx functions encode error statuses as small
-/// negative values; recover the enum (repr is i32 — UCS_ERR_LAST is -100).
+/// negative values; recover the enum. bindgen gives `ucs_status_t` an 8-bit
+/// repr (its values span UCS_OK..UCS_ERR_LAST, i.e. 1..=-100, which fits i8),
+/// so transmute through i8.
 fn ptr_to_status(ptr: *mut c_void) -> raw::ucs_status_t {
-    unsafe { std::mem::transmute::<i32, raw::ucs_status_t>(ptr as usize as u32 as i32) }
+    unsafe { std::mem::transmute::<i8, raw::ucs_status_t>(ptr as i8) }
 }
 
 fn is_err_ptr(ptr: *mut c_void) -> bool {
@@ -173,7 +175,16 @@ impl Context {
             params.field_mask = raw::ucp_params_field::UCP_PARAM_FIELD_FEATURES as u64;
             params.features = raw::ucp_feature::UCP_FEATURE_TAG as u64;
             let mut handle: raw::ucp_context_h = ptr::null_mut();
-            let status = raw::ucp_init(&params, config, &mut handle);
+            // ucp_init is a `static inline` wrapper in ucp.h since UCX 1.15
+            // (bindgen cannot bind it); call the real entry point directly,
+            // exactly as the inline does.
+            let status = raw::ucp_init_version(
+                raw::UCP_API_MAJOR as _,
+                raw::UCP_API_MINOR as _,
+                &params,
+                config,
+                &mut handle,
+            );
             raw::ucp_config_release(config);
             if status != raw::ucs_status_t::UCS_OK {
                 return Err(status_error("ucp_init", status));
@@ -235,9 +246,9 @@ impl Worker {
         let cb_raw = Box::into_raw(cb);
         unsafe {
             let mut params: raw::ucp_listener_params_t = std::mem::zeroed();
-            params.field_mask = (raw::ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
-                | raw::ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_CONN_HANDLER)
-                as u64;
+            params.field_mask = raw::ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
+                as u64
+                | raw::ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_CONN_HANDLER as u64;
             params.sockaddr = holder.as_ucs_sock_addr();
             params.conn_handler = raw::ucp_listener_conn_handler_t {
                 cb: Some(conn_request_trampoline),
@@ -263,9 +274,8 @@ impl Worker {
         let holder = SockAddrHolder::new(addr);
         unsafe {
             let mut params: raw::ucp_ep_params_t = std::mem::zeroed();
-            params.field_mask = (raw::ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
-                | raw::ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS)
-                as u64;
+            params.field_mask = raw::ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR as u64
+                | raw::ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS as u64;
             params.flags = raw::ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER as u32;
             params.sockaddr = holder.as_ucs_sock_addr();
             self.create_ep(&params)
@@ -326,10 +336,10 @@ impl Worker {
         let state = OpState::new();
         let mut info: raw::ucp_tag_recv_info_t = unsafe { std::mem::zeroed() };
         let mut params: raw::ucp_request_param_t = unsafe { std::mem::zeroed() };
-        params.op_attr_mask = (raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
-            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE
-            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_RECV_INFO) as u32;
+        params.op_attr_mask = raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32
+            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA as u32
+            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE as u32
+            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_RECV_INFO as u32;
         params.cb.recv = Some(recv_completed_cb);
         params.datatype = DT_CONTIG_BYTE;
         params.user_data = &state as *const OpState as *mut c_void;
@@ -367,9 +377,9 @@ impl Worker {
     ) -> Result<(), Error> {
         let state = OpState::new();
         let mut params: raw::ucp_request_param_t = unsafe { std::mem::zeroed() };
-        params.op_attr_mask = (raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
-            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE) as u32;
+        params.op_attr_mask = raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32
+            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA as u32
+            | raw::ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE as u32;
         params.cb.send = Some(op_completed_cb);
         params.datatype = DT_CONTIG_BYTE;
         params.user_data = &state as *const OpState as *mut c_void;
