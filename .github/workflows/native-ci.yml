@@ -58,7 +58,9 @@ jobs:
           curl -sfL "https://github.com/openucx/ucx/releases/download/${tag}/ucx-${version}.tar.gz" -o /tmp/ucx.tar.gz
           tar -xzf /tmp/ucx.tar.gz -C /tmp
           cd /tmp/ucx-${version}
-          ./configure --prefix="$HOME/ucx"
+          # Language bindings are auto-detected and break on the runner's Go;
+          # we only need the C library.
+          ./configure --prefix="$HOME/ucx" --without-go --without-java
           make -j"$(nproc)"
           make install
 
