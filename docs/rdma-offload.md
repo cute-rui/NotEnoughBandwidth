@@ -131,7 +131,7 @@ NEB 本地压缩的链路是：`Connection.send` 被拦截 → 聚合 20ms → �
     ```bash
     git clone https://github.com/openucx/ucx.git && cd ucx
     ./autogen.sh
-    ./contrib/configure-release --prefix=/opt/ucx --with-verbs --with-rdmacm
+    ./contrib/configure-release --prefix=/opt/ucx --with-verbs --with-rdmacm --without-go --without-java
     make -j$(nproc) && sudo make install
     ```
 
