@@ -34,7 +34,7 @@ jobs:
 
       - name: Verify UCX installation
         run: |
-          ucx_info --version
+          ucx_info -v
           test -f /usr/include/ucp/api/ucp.h && echo "ucp.h found"
           pkg-config --modversion ucx || echo "no ucx.pc, default include paths will be used"
 
