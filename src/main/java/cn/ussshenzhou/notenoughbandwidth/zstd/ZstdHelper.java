@@ -1,6 +1,8 @@
 package cn.ussshenzhou.notenoughbandwidth.zstd;
 
 import cn.ussshenzhou.notenoughbandwidth.NotEnoughBandwidthConfig;
+import cn.ussshenzhou.notenoughbandwidth.zstd.remote.RemoteContext;
+import cn.ussshenzhou.notenoughbandwidth.zstd.remote.RemoteOffloadManager;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.RemovalListener;
@@ -18,9 +20,9 @@ import java.util.concurrent.ExecutionException;
  */
 public class ZstdHelper {
 
-    private static final Cache<Connection, Context> ZSTD_CONTEXT_CACHE = CacheBuilder.newBuilder()
+    private static final Cache<Connection, ZstdContext> ZSTD_CONTEXT_CACHE = CacheBuilder.newBuilder()
             .weakKeys()
-            .removalListener((RemovalListener<Connection, Context>) notification -> {
+            .removalListener((RemovalListener<Connection, ZstdContext>) notification -> {
                 if (notification.getValue() != null) {
                     notification.getValue().close();
                 }
@@ -46,10 +48,12 @@ public class ZstdHelper {
         }
     }
 
-    private static Context get(Connection connection) {
+    private static ZstdContext get(Connection connection) {
         ZSTD_CONTEXT_CACHE.asMap().entrySet().removeIf(e -> !e.getKey().isConnected());
         try {
-            return ZSTD_CONTEXT_CACHE.get(connection, () -> new Context(useContext(connection)));
+            return ZSTD_CONTEXT_CACHE.get(connection, () -> RemoteOffloadManager.get().available()
+                    ? new RemoteContext(useContext(connection))
+                    : new Context(useContext(connection)));
         } catch (ExecutionException e) {
             throw new RuntimeException(e);
         }

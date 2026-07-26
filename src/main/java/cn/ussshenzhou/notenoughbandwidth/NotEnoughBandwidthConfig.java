@@ -35,6 +35,17 @@ public class NotEnoughBandwidthConfig implements TConfig {
     public HashSet<String> playersDoNotUseContext = new HashSet<>() {{
         add("00000000-0000-0000-0000-000000000000");
     }};
+    /**
+     * Whether to offload zstd compression/decompression to a remote server over UCX/RDMA.
+     * Falls back to local compression when disabled, unavailable, or broken.
+     */
+    public boolean remoteOffloadEnabled = false;
+    /**
+     * Absolute path of the native client library (libneb_zstd_client).
+     */
+    public String remoteOffloadLibrary = "";
+    public String remoteOffloadAddress = "127.0.0.1:19999";
+    public int remoteOffloadWorkers = 8;
 
     @SuppressWarnings("UnstableApiUsage")
     @Expose(serialize = false, deserialize = false)

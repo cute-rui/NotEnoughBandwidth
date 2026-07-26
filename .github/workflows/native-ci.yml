@@ -1,0 +1,68 @@
+name: Native (Rust) CI
+
+# CI for the UCX/RoCE remote zstd offload workspace (native/):
+# ucx-ffi, neb-zstd-server, neb-zstd-client, neb-offload-core.
+#
+# UCX is installed from the Ubuntu repositories (libucx-dev). Runners have no
+# RDMA NIC, so the end-to-end test forces UCX onto TCP/shared-memory
+# transports (UCX_TLS=tcp,self) — it exercises the full wire protocol and both
+# binaries; only the RDMA-specific transport paths require manual testing on
+# real hardware (see docs/rdma-offload.md).
+
+on:
+  push:
+    paths:
+      - 'native/**'
+      - '.github/workflows/native-ci.yml'
+  pull_request:
+    paths:
+      - 'native/**'
+      - '.github/workflows/native-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install UCX and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libucx-dev ucx-utils libclang-dev clang pkg-config build-essential
+
+      - name: Verify UCX installation
+        run: |
+          ucx_info --version
+          test -f /usr/include/ucp/api/ucp.h && echo "ucp.h found"
+          pkg-config --modversion ucx || echo "no ucx.pc, default include paths will be used"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Format check
+        working-directory: native
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace
+        working-directory: native
+        run: cargo build --workspace
+
+      - name: Unit tests
+        working-directory: native
+        run: cargo test -p neb-offload-core -p neb-zstd-client
+
+      - name: End-to-end test (UCX over TCP, no RDMA on runners)
+        working-directory: native
+        env:
+          NEB_E2E: '1'
+          UCX_TLS: tcp,self
+        run: cargo test -p neb-zstd-client --test e2e -- --nocapture
