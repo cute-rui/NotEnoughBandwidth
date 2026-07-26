@@ -109,7 +109,7 @@ OPTIONS:
     --listen ADDR:PORT   Listen address (default: {DEFAULT_LISTEN})
     --metrics-listen ADDR:PORT
                          Prometheus metrics endpoint serving GET /metrics
-                         (default: {DEFAULT_METRICS_LISTEN}, "off" to disable)
+                         (default: {DEFAULT_METRICS_LISTEN}, \"off\" to disable)
     --threads N          Serve worker threads (default: available parallelism)
     --level N            zstd compression level, 1..=22 (default: {DEFAULT_LEVEL})
     --window-log N       zstd window log, 21..=25 (default: {DEFAULT_WINDOW_LOG})
